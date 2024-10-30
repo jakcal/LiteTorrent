@@ -1,16 +1,19 @@
 import os
 import hashlib
 import json
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Random import get_random_bytes
 
-CHUNK_SIZE = 500 * 1024  # 500 KB chunks
+CHUNK_SIZE = 500 * 1024
 
 def hash_file(filepath):
     hasher = hashlib.sha256()
     with open(filepath, 'rb') as f:
         for chunk in iter(lambda: f.read(4096), b""):
             hasher.update(chunk)
-    return hasher.hexdigest()
- 
+    return hasher.digest()
+
 def list_files(folder):
     files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
     if not files:
@@ -35,29 +38,44 @@ def select_file(folder):
         except ValueError:
             print("Invalid input. Please enter a number.")
 
+def encrypt_chunk(chunk, key):
+    cipher = AES.new(key, AES.MODE_CBC)
+    iv = cipher.iv
+    encrypted_chunk = cipher.encrypt(pad(chunk, AES.block_size))
+    return iv + encrypted_chunk  # Prefix the IV for use in decryption
+
+def decrypt_chunk(encrypted_chunk, key):
+    iv = encrypted_chunk[:AES.block_size]
+    cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+    chunk = unpad(cipher.decrypt(encrypted_chunk[AES.block_size:]), AES.block_size)
+    return chunk
+
 def split_file(filepath, chunk_folder, tracker_file):
     if not os.path.exists(chunk_folder):
         os.makedirs(chunk_folder)
 
     file_hash = hash_file(filepath)
+    encryption_key = file_hash[:32]  # AES-256 key
+
     metadata = {
         "filename": os.path.basename(filepath),
-        "file_hash": file_hash,
+        "file_hash": file_hash.hex(),
         "chunks": [],
     }
     chunk_index = 0
     
     with open(filepath, 'rb') as f:
         while chunk := f.read(CHUNK_SIZE):
-            chunk_hash = hashlib.sha256(chunk).hexdigest()
-            chunk_filename = f"{chunk_folder}/chunk_{chunk_index}.part"
+            encrypted_chunk = encrypt_chunk(chunk, encryption_key)
+            chunk_hash = hashlib.sha256(encrypted_chunk).hexdigest()
+            chunk_filename = f"{chunk_folder}/lto{chunk_hash}.part"
             with open(chunk_filename, 'wb') as chunk_file:
-                chunk_file.write(chunk)
+                chunk_file.write(encrypted_chunk)
             
             metadata["chunks"].append({
                 "index": chunk_index,
                 "filename": chunk_filename,
-                "chunk_size": len(chunk),
+                "chunk_size": len(encrypted_chunk),
                 "chunk_hash": chunk_hash,
             })
             chunk_index += 1
@@ -72,22 +90,25 @@ def reassemble_file(tracker_path, output_folder):
     with open(tracker_path, 'r') as tracker_file:
         metadata = json.load(tracker_file)
     
+    file_hash = bytes.fromhex(metadata["file_hash"])
+    decryption_key = file_hash[:32]  # AES-256 key
+
     output_filepath = os.path.join(output_folder, metadata["filename"])
     with open(output_filepath, 'wb') as output_file:
         for chunk_meta in metadata["chunks"]:
             with open(chunk_meta["filename"], 'rb') as chunk_file:
-                chunk_data = chunk_file.read()
-                # Validate chunk hash
-                if hashlib.sha256(chunk_data).hexdigest() != chunk_meta["chunk_hash"]:
+                encrypted_chunk = chunk_file.read()
+                if hashlib.sha256(encrypted_chunk).hexdigest() != chunk_meta["chunk_hash"]:
                     raise ValueError(f"Chunk {chunk_meta['index']} is corrupted.")
+                chunk_data = decrypt_chunk(encrypted_chunk, decryption_key)
                 output_file.write(chunk_data)
 
     print("File reassembly complete:", output_filepath)
 
 def main():
-    action = input("Enter 'split' to split a file or 'assemble' to reassemble a file: ").strip().lower()
+    action = input("Enter 's' to split a file or 'a' to reassemble a file: ").strip().lower()
 
-    if action == "split":
+    if action == "s":
         src_folder = input("Enter the source folder name: ").strip()
         src_filepath = select_file(src_folder)
         if not src_filepath:
@@ -98,7 +119,7 @@ def main():
 
         split_file(src_filepath, chunk_folder, tracker_file)
 
-    elif action == "assemble":
+    elif action == "a":
         tracker_folder = input("Enter the folder containing the tracker file: ").strip()
         tracker_file = input("Enter the tracker file name (e.g., 'tracker.json'): ").strip()
         output_folder = input("Enter the folder to save the reassembled file: ").strip()
@@ -107,7 +128,7 @@ def main():
         reassemble_file(tracker_filepath, output_folder)
 
     else:
-        print("Invalid option. Please enter 'split' or 'assemble'.")
+        print("Invalid option. Please enter 's' or 'a'.")
 
 if __name__ == "__main__":
     main()
